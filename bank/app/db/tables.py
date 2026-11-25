@@ -119,4 +119,84 @@ class PromptTemplate(Base):
         comment="创建时间 Unix 秒",
     )
 
+class Session(Base):
+    """会话表：承载用户的学习/面试/笔记会话。"""
 
+    __tablename__ = "sessions"
+    __table_args__ = {"comment": "会话表"}
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True, autoincrement=True, comment="主键")
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=False, comment="用户 FK"
+    )
+    session_model: Mapped[int] = mapped_column(
+        nullable=False, comment="会话模式：0=学习，1=面试，2=笔记")
+    title: Mapped[str] = mapped_column(
+        String(255), nullable=False, comment="标题")
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=_unix_ts,
+        comment="创建时间 Unix 秒",
+    )
+
+class ChatMessage(Base):
+    """消息表：记录用户请求与模型响应。"""
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        # 按会话拉取消息并按时间排序时走索引，避免全表扫。
+        Index("idx_session_id_created_at", "session_id", "created_at"),
+        {"comment": "消息表"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True, autoincrement=True, comment="主键")
+    user_id: Mapped[int] = mapped_column(ForeignKey(
+        "users.id"), nullable=False, comment="用户 FK")
+    session_id: Mapped[int] = mapped_column(ForeignKey(
+        "sessions.id"), nullable=False, comment="会话 FK")
+    select_model: Mapped[int] = mapped_column(
+        nullable=False,
+        comment="选择模式：0=默认，1=知识精讲，2=刷题，3=简历优化，4=模拟面试，5=面试复盘",
+    )
+    request_id: Mapped[str] = mapped_column(
+        String(64), index=True, nullable=False, comment="请求唯一标识"
+    )
+    # MEDIUMTEXT：单条请求/回复可能很长。
+    request_text: Mapped[str] = mapped_column(
+        MEDIUMTEXT, nullable=False, comment="用户请求文本")
+    response_text: Mapped[str] = mapped_column(
+        MEDIUMTEXT, nullable=False, comment="模型响应文本")
+    # 仅存附件段信息（file/image/audio），不存聊天正文文本。
+    request_segments: Mapped[list[dict] | None] = mapped_column(
+        JSON, nullable=True, comment="用户请求附件段 JSON")
+    # 仅存附件段信息（file/image/audio），不存聊天正文文本。
+    response_segments: Mapped[list[dict] | None] = mapped_column(
+        JSON, nullable=True, comment="模型响应附件段 JSON")
+    response_payload: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True, comment="模型响应结构化载荷 JSON")
+    reference_sources: Mapped[list[dict] | None] = mapped_column(
+        JSON, nullable=True, comment="本次回答引用的知识片段来源")
+    # 消息状态：0=常规聊天；1=面试转写入口消息。
+    status: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="消息状态：0常规聊天，1面试转写入口",
+    )
+    # 关联面试记录ID，status=1 时可用。
+    interview_id: Mapped[int | None] = mapped_column(
+        nullable=True,
+        index=True,
+        comment="面试记录ID（status=1 时可用）",
+    )
+    file_extracted_text: Mapped[str] = mapped_column(
+        MEDIUMTEXT, nullable=True, comment="从文件中总结的文本(对话上下文用)")
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=_unix_ts,
+        comment="创建时间 Unix 秒",
+    )

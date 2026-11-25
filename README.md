@@ -27,17 +27,15 @@
 
 ---
 
-## 第二阶段：数据库 + 提示词层 + 流式对话
+## 第二阶段：提示词三层：公共模板、私有模板、用户变量注入
 
 ### 目标
 
-在阶段一的模型工厂之上，打通「用户画像 → 提示词模板（版本化）→ Prompt 组装 → 流式对话」的完整链路，同时引入 MySQL + Redis 作为持久化与缓存底座。
+打通「用户画像 → 提示词模板（版本化）→ Prompt 组装」,同时引入 MySQL + Redis 作为持久化与缓存底座。
 
 ### 完成内容
 
 1. **持久化与缓存底座**
-   - 引入 MySQL 作为业务数据持久化存储，Redis 作为提示词模板缓存。
-   - 建立 FastAPI 依赖注入式的数据库会话管理，每个请求独立 Session、结束自动释放。
    - 定义两张核心表：一张存用户画像（目标岗位、经验、薄弱点、学习目标等），一张存提示词模板（支持版本自增、生效开关、公共/私有区分）。
    - 价值点：请求级 Session 避免串数据，JSON 字段灵活扩展画像结构，模板表为后续多智能体场景复用打基础。
 
@@ -56,15 +54,10 @@
 4. **提示词组装**
    - 三层流水线：安全校验 → 格式规整 → 占位符注入，每一层职责单一。
    - 注入时对用户输入做 XSS 关键字过滤和长度截断，避免恶意内容污染 Prompt。
-   - 支持 RAG 场景：检索到知识库资料时追加参考规则，未检索到时明确告知模型不要编造。
    - 对 Prompt 中的花括号做转义，防止 JSON 内容被 LangChain 误解析为变量占位符。
    - 价值点：把"Prompt 怎么拼"这一易变逻辑从对话链路中抽离，改 Prompt 不用改对话代码。
 
-5. **流式对话链路**
-   - 串起 Prompt 组装 → LangChain 链执行 → SSE 流式推送，FastAPI 直接 yield `StreamingResponse`。
-   - 价值点：用户能边生成边看到回复，体感延迟显著降低；链路本身无状态，便于后续多 agent 编排。
-
-6. **启动预热**
+5. **启动预热**
    - 应用启动时自动把生效中的提示词模板批量写入 Redis，避免首个请求打到 DB。
    - Redis 不可用时自动跳过，不影响应用启动。
    - 价值点：冷启动即完成缓存预热，首个请求延迟从"查 DB + 写缓存"降到"纯读缓存"。
@@ -74,4 +67,51 @@
 - **三层 Prompt 组装**：验证 → 格式化 → 注入，每一层职责单一，便于单独替换或扩展。
 - **公共 + 私有模板拼接**：`get_full_prompt()` 把场景级公共模板作为前缀，agent 私有模板追加，既保证全局统一指令又允许各 agent 定制。
 - **Redis 自动降级**：`PromptTemplateManager.__init__` 里 try/except，Redis 挂了就 `self.use_redis = False`，后续所有读操作 fallback 到 DB，启动不受影响。
-- **流式链路无状态**：LangChain 1.x 写法，历史消息由调用方传入 `stream_inputs["history"]`，链路本身只做 `prompt | llm`，无需 `RunnableWithMessageHistory` 包装。
+
+
+## 第三阶段：SSE 流式聊天，先占位再补全文
+
+### 目标
+
+在阶段二的 Prompt 组装之上，打通「会话校验 → 消息占位落库 → 流式生成 → 全量回写」的对话闭环，让前端通过 SSE 边生成边展示，同时保证异常中断也能留住已生成内容。
+
+### 完成内容
+
+1. **会话与消息持久化**
+   - 新增 `sessions` 表：记录 `user_id`、`session_model`（0=学习，1=面试，2=笔记）、`title`。
+   - 新增 `chat_messages` 表：记录 `request_id`、请求/响应正文、附件段（`request_segments` / `response_segments`）、结构化载荷、引用来源（`reference_sources`）、消息状态（`status`）、关联面试 `interview_id` 与文件提取文本。
+   - 建立 `(session_id, created_at)` 联合索引，保证按会话拉历史消息走索引。
+   - 价值点：正文与附件段分离存储，避免把图片/文件信息塞进聊天文本；引用来源结构化后便于前端展示"来源"入口。
+
+2. **会话归属校验**
+   - `SessionService.get_session_or_404()` 按 `user_id + session_id`（可选 `session_model`）查询，不存在直接抛 404。
+   - 价值点：会话与用户绑定，防止越权读取他人会话；校验放在流式生成之前，避免无效请求占用模型资源。
+
+3. **先占位再补全文**
+   - 请求进入后先写入一条 `response_text=""` 的占位消息并提交，拿到自增 `row.id`。
+   - 通过首帧 `start` 事件把 `message_id` 下发给前端，前端可立即完成乐观渲染与消息定位。
+   - 生成结束后在 `finally` 中回写完整 `response_text` 与 `reference_sources`，无论正常结束还是异常中断都会落库。
+   - 价值点：把"长耗时生成"和"消息唯一标识"解耦，前端不必等整段回复生成完才拿到消息 ID；断流时也能保留已生成的部分内容。
+
+4. **SSE 事件协议**
+   - `_sse_data()` 统一把事件对象编码为 `data: {...}\n\n`，使用 `ensure_ascii=False` 保证中文可读。
+   - 事件类型：
+     - `start`：`{message_id}`，流开始；
+     - `delta`：`{text}`，文本增量；
+     - `error`：`{message}`，生成异常；
+     - `done`：`{response_text, sources}`，全量结果与引用来源。
+   - `StreamingResponse` 声明 `text/event-stream`，并带 `Cache-Control: no-cache`、`Connection: keep-alive`、`X-Accel-Buffering: no`，避免代理层缓冲导致"假流式"。
+   - 价值点：事件按 `type` 分发，前端只需处理四种事件即可完成整轮对话；`done` 携带全量文本，便于前端做最终校对与本地缓存。
+
+5. **流式对话链路**
+   - `build_stream_chain_context()` 返回 `(chain, stream_inputs)`，链路本身是 `prompt | llm`，无状态，历史消息由调用方通过 inputs 注入。
+   - 有 `agent_name + scene` 时走个性化 Prompt（公共模板 + 私有模板 + 用户变量注入），否则使用通用兜底 Prompt。
+   - system prompt 中的花括号统一转义，防止 JSON 内容被 `ChatPromptTemplate` 误解析为变量占位符。
+   - `_extract_text_delta()` 只提取 `AIMessageChunk.content`，过滤掉非文本块与空增量。
+   - 价值点：对话入口只关心"校验 + 落库 + 推送"，Prompt 结构与模型创建分别由阶段二和阶段一承担，后续接 RAG 或多 agent 时只改上下文构造。
+
+### 关键设计
+
+- **占位行先行**：消息 ID 在生成前就已确定，既是前端渲染锚点，也是后续历史记忆截断、引用来源回写的依据。
+- **事件化协议**：`start / delta / error / done` 四类事件职责清晰，异常也以事件形式下发，前端不会因为连接中断而无从判断。
+- **异常闭环**：`try/except` 只收集错误信息，统一在 `finally` 中落库，保证"出错也有一条完整消息记录"，`error` 事件先于 `done` 发送。
