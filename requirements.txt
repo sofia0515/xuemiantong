@@ -26,6 +26,8 @@ passlib==1.7.4
 pydantic==2.12.5
 # Pydantic v2 核心运行时
 pydantic_core==2.41.5
+# Pydantic 2.x 的 settings 子包（BaseSettings 从此包导入）
+pydantic-settings==2.15.0
 # MySQL 数据库驱动
 PyMySQL==1.1.1
 # 从 .env 文件加载环境变量
