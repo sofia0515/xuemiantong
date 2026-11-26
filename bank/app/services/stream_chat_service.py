@@ -131,7 +131,7 @@ class StreamChatService:
                 if response_text and not error_message:
                     print("#把本轮追加进工作记忆，并按意图异步更新画像。")
             if error_message:
-                yield _sse_data({"type": "error", "message": error_message})
+                yield _sse_data({"type": "error", "message": error_message})#只发事件、不改状态码
             yield _sse_data({"type": "done","response_text": response_text, "sources": sources})             
 
 

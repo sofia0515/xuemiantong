@@ -1,4 +1,5 @@
 """提示词层：统一组装 Prompt 模板"""
+from langchain_core.messages import SystemMessage
 from app.agent.llm import get_chat_model
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -7,6 +8,8 @@ from app.services.prompt_template_service import prompt_template_manager
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 from typing import Any, Optional
+
+from bank.app.services.memory_service import MemoryService
 
 def build_personalized_prompt(
     db: Session,
@@ -118,9 +121,29 @@ def build_stream_chain_context(
     session_model: int | None = None,
 ) -> tuple[Runnable, dict[str, Any]]:
     """组装流式链路上下文，返回可执行链与输入变量。"""
-    #system_prompt 为 None 时使用默认兜底提示词，确保链路始终可用。
+    # 1) 统一记忆入口：返回已合并的最终历史，可能来自工作记忆、短期记忆或后续长期记忆。
+    memory_context = MemoryService(db).load_context(
+        user_id=user_id,
+        session_id=session_id,
+        before_message_id=current_message_id,
+        session_model=session_model,
+        query=request_text,
+    )
+    history_messages = memory_context["history_messages"]
+    # 系统提示词的文字单独收走，对话列表里只留用户和 AI 的来回。
+    memory_system_prompt = [
+        str(message.content).strip()
+        for message in history_messages
+        if isinstance(message, SystemMessage) and str(message.content).strip()
+    ]
+    if memory_system_prompt:
+        history_messages = [message for message in history_messages if not isinstance(message, SystemMessage)]
+
+    # 2) system_prompt 为 None 时使用默认兜底提示词，确保链路始终可用。
     if system_prompt is None:
         system_prompt = "你是一个简洁、可靠的单Agent助手。优先直接回答问题，不要包装成 JSON。"
+    if memory_system_prompt:
+        system_prompt = "\n\n".join(([system_prompt, *memory_system_prompt]))
     
     # 转义 system_prompt 中的花括号，防止 ChatPromptTemplate 把 JSON 内容误解析为变量占位符。
     safe_system_prompt = system_prompt.replace("{", "{{").replace("}", "}}")
@@ -135,7 +158,6 @@ def build_stream_chain_context(
         ]
     )
 
-    # [1.x 新写法] 历史消息直接注入 inputs，链路本身只是 prompt | llm，无需 RunnableWithMessageHistory 包装。
     chain = prompt | get_chat_model(provider=provider)
     stream_inputs = {
         # "history": history_messages,
