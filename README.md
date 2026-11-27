@@ -263,3 +263,79 @@
 - **预算控制**：检索 top_k=3、分数阈值 0.4、单条截断 800 字，三层限制保证 RAG 不会把上下文吃光。
 - **双向关联**：UUID 同时作为 Qdrant Point id 和 MySQL `vector_id`，检索结果和原文一一对应，无需额外映射表。
 
+
+## 第六阶段：LangGraph 学习测评工作流（出题 → 中断 → 交卷 → 评分）
+
+### 目标
+
+把"出题 → 等用户作答 → 评分"这套跨多轮请求的业务流程，从"一次性 HTTP 调用"改成"可中断、可恢复、状态可落库"的图执行。核心问题：用户从看到题目到交卷可能间隔几分钟，HTTP 请求早已结束，必须把图状态持久化，等用户交卷时再从断点恢复。
+
+### 图结构
+
+四个节点串行，唯一分支是中断：
+
+```
+generate_quiz → wait_user_answer(interrupt) → evaluate_answer → finalize_result → END
+```
+
+- `generate_quiz`：调用大模型出题，产出 `quiz` 结构（标题、描述、题目列表），状态置为 `waiting_answer`。
+- `wait_user_answer`：调用 `interrupt()` 把 quiz 抛给前端，**图执行在此挂起**，等待下次 `Command(resume=answers)` 唤醒。
+- `evaluate_answer`：拿到用户答案后，调用大模型评分，产出 `score / items / weaknesses / review / display_text`。
+- `finalize_result`：收尾，状态置为 `completed`。
+
+### 完成内容
+
+1. **状态模型（Pydantic）**
+   - `LearningWorkflowState`：`run_id / user_id / session_id / request_text / question_count / quiz / answers / evaluation / score / weaknesses / review / status`。
+   - `WorkflowStatus` 枚举：`created → generating_quiz → waiting_answer → grading → completed / failed`。
+   - 价值点：图节点之间通过强类型状态传递，字段缺省有默认值，不会因为少传字段崩掉。
+
+2. **Checkpoint 机制**
+   - `MemorySaver` 进程内共享单例（`lru_cache`），按 `thread_id` 隔离不同 run。
+   - `build_thread_config(run_id)` 统一生成 `{"configurable": {"thread_id": run_id}}`，图恢复时必须传同一 config。
+   - 价值点：中断后图状态自动序列化到 checkpointer，下次 `invoke(Command(resume=...), config)` 从断点继续，不重跑出题节点。
+
+3. **出题节点**
+   - 动态 Prompt：优先从提示词模板表取 `quiz_generate_workflow` 模板，取不到走硬编码兜底。
+   - 模板渲染用简单字符串替换（`{request_text}` / `{question_count}`），避免 JSON 示例中的 `{}` 被 `str.format` 误解析。
+   - 模型输出 JSON 清洗：`extract_json_object()` 去掉 Markdown 代码块围栏，再用正则截取首个 `{...}` 对象。
+   - 题目合法性过滤：只接受 `radio / checkbox / textarea` 三种题型，其余丢弃。
+
+4. **中断节点**
+   - `interrupt({"quiz": ...})` 把 quiz 作为中断值抛给调用方，**图执行暂停**。
+   - 前端拿到 quiz 后渲染表单，用户交卷时把答案列表作为 `Command(resume=answers)` 的输入唤醒图。
+   - 价值点：出题和评分解耦在两个 HTTP 请求里，中间用户思考多久都行，不占连接、不占模型。
+
+5. **评分节点**
+   - 动态 Prompt：优先取 `learning_evaluator` 模板，拼接 quiz JSON 和 answers JSON，再追加"display_text 必须包含总分、逐题点评、参考答案、薄弱点、学习建议"的补充约束。
+   - 分数钳制：`score = max(0, min(score, 100))`，防止模型输出越界。
+   - 输出收敛：`display_text` 优先，其次 `review`，最后兜底文案，保证前端总有内容可展示。
+
+6. **工作流运行记录（MySQL 持久化）**
+   - `workflow_runs` 表：`run_id / user_id / session_id / workflow_type / status / state_json / error_message / completed_at`。
+   - `state_json` 存完整状态 dict，即使进程重启 / checkpointer 丢失，也能从 MySQL 重建。
+   - 索引：`(user_id, workflow_type, status)` 查用户运行列表，`(session_id, workflow_type)` 查会话下的工作流。
+   - 价值点：checkpointer（内存）只负责图执行断点，MySQL 负责业务可追溯，两者互补。
+
+7. **服务层封装**
+   - `LearningWorkflowService.start()`：校验会话 → 创建 run 记录 → 出题（带重试）→ 更新状态为 `waiting_answer` → 写入一条 `chat_messages`（`response_payload` 携带 quiz 表单）。
+   - `submit_answer()`：按 `run_id` 查 run → 校验状态是 `waiting_answer` → 提交答案恢复图 → 评分（带重试）→ 更新状态为 `completed` → 原地更新同一条 `chat_messages`（把表单 payload 换成点评文本）。
+   - 价值点：前端历史列表里只看到一条消息，出题时是表单，交卷后原地变成点评，不出现"出题一条、评分一条"的重复。
+
+8. **自动重试**
+   - `RetryExecutor`：默认最多 2 次，失败时把 `auto_retry_count / last_auto_retry_node` 写回状态。
+   - 出题或评分失败时先重试一次，仍失败则 `mark_failed()` 把状态置为 `failed` 并记录 `error_message`。
+
+### 关键设计（生产级要点）
+
+- **中断即挂起**：`interrupt()` 不是普通返回，图执行状态被 checkpointer 冻结，恢复时从断点继续，不重跑已完成节点。这是 LangGraph 区别于"一次性函数调用"的核心能力。
+- **双通道持久化**：内存 checkpointer 管图执行断点（快、易失），MySQL `workflow_runs` 管业务状态（慢、可靠）。进程重启后 checkpointer 丢失，但 MySQL 里有完整状态，可以重建。
+- **状态即契约**：节点之间只通过 `LearningWorkflowState` 通信，不共享全局变量；Pydantic 保证字段类型和默认值。
+- **原地更新消息**：出题和评分共用同一条 `chat_messages`，`request_id = "{run_id}:quiz"`，交卷后 `response_payload` 从表单换成 `None`、`response_text` 换成点评文本，前端历史列表无重复。
+- **模板优先、硬编码兜底**：Prompt 模板从 DB 取，取不到用代码里的硬编码版本，保证"模板表为空时图也能跑"。
+- **失败可追溯**：`mark_failed()` 记录失败节点和错误信息，`state_json.status = failed`，前端可据此展示"出题失败，请重试"。
+
+### 待补齐
+
+- Checkpointer 当前是 `MemorySaver`（进程内存），多实例部署或重启会丢失断点，需换 Redis / PostgreSQL checkpointer。
+- 超时机制：用户中断后一直不交卷，run 记录永久停在 `waiting_answer`，需要定时任务清理或过期失效。

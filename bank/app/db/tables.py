@@ -291,3 +291,38 @@ class KnowledgeChunk(Base):
         default=_unix_ts,
         comment="创建时间 Unix 秒",
     )
+
+
+class WorkflowRun(Base):
+    """工作流运行记录：保存跨请求执行的图状态。"""
+
+    __tablename__ = "workflow_runs"
+    __table_args__ = (
+        Index("idx_user_workflow_status", "user_id", "workflow_type", "status"),
+        Index("idx_session_workflow", "session_id", "workflow_type"),
+        {"comment": "工作流运行记录表"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        primary_key=True, autoincrement=True, comment="主键")
+    run_id: Mapped[str] = mapped_column(
+        String(64), unique=True, index=True, nullable=False, comment="工作流运行ID")
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=False, comment="用户 FK")
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("sessions.id"), index=True, nullable=False, comment="会话 FK")
+    workflow_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, comment="工作流类型，如 learning_quiz")
+    status: Mapped[str] = mapped_column(
+        String(32), index=True, nullable=False, comment="运行状态")
+    state_json: Mapped[dict] = mapped_column(
+        JSON, nullable=False, comment="可恢复的工作流状态 JSON")
+    error_message: Mapped[str | None] = mapped_column(
+        String(500), nullable=True, comment="失败原因")
+    created_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=_unix_ts, comment="创建时间 Unix 秒")
+    updated_at: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=_unix_ts, onupdate=_unix_ts, comment="更新时间 Unix 秒")
+    completed_at: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="完成时间 Unix 秒")
+

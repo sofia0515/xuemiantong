@@ -5,6 +5,17 @@ from typing import Optional
 import redis
 import json
 
+AGENT_CONFIG = {
+    "flow_controller": {"scene": "workflow", "name": "流程总控Agent"},
+    "resume_parser": {"scene": "resume", "name": "资料&简历解析Agent"},
+    "quiz_generate_workflow": {"scene": "quiz", "name": "出题题库Agent"},
+    "learning_evaluator": {"scene": "quiz_evaluation", "name": "学习测评评分Agent"},
+    "interview_host": {"scene": "interview", "name": "面试主考官Agent"},
+    "interview_evaluator": {"scene": "evaluation", "name": "面试评测Agent"},
+    "difficulty_learner": {"scene": "study", "name": "难点学习Agent"},
+    "note_archiver": {"scene": "note", "name": "笔记归档Agent"},
+}
+
 class PromptTemplateManager:
     """提示词模板管理器：负责模板持久化、版本控制、Redis缓存、公共模板拼接。"""
     def __init__(self):

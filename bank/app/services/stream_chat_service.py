@@ -88,8 +88,8 @@ class StreamChatService:
         elif should_retrieve(request_text):
             retrieved_chunks = search_similar_chunks(
                 db=db,
-                request_text=request_text,
-                db=db,
+                query=request_text,
+                user_id=user_id,
                 top_k=3,
             )
             retrieved_text = format_retrieved_chunks(retrieved_chunks)# 格式化为本轮用户问题的参考资料上下文
