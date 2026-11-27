@@ -1,7 +1,8 @@
-from sqlalchemy import BigInteger, ForeignKey, Index, JSON, String
+from sqlalchemy import BigInteger, ForeignKey, Index, JSON, String, DateTime, func, UniqueConstraint
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 import time
+from datetime import datetime
 
 
 # 创建基类
@@ -194,6 +195,96 @@ class ChatMessage(Base):
     )
     file_extracted_text: Mapped[str] = mapped_column(
         MEDIUMTEXT, nullable=True, comment="从文件中总结的文本(对话上下文用)")
+    created_at: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=_unix_ts,
+        comment="创建时间 Unix 秒",
+    )
+class Resource(Base):
+    """资源治理总表：统一管理文件、图片、音频元数据。"""
+
+    __tablename__ = "resources"
+    __table_args__ = (
+        UniqueConstraint("file_hash", "user_id", name="uk_file_hash_user_id"),
+        # 业务分类查询索引：用于 list 用户的简历 / 学习资料等。
+        Index("idx_user_id_doc_category", "user_id", "doc_category"),
+        {"comment": "资源治理总表（单表方案）"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+        comment="资源主键ID",
+    )
+    resource_type: Mapped[int] = mapped_column(
+        nullable=False, comment="资源类型：0=文件，1=图片，2=音频"
+    )
+    storage_scene: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="存储场景：0=长过期，1=短过期，2=只提取内容不存原文件，3=永久存储",
+    )
+    upload_purpose: Mapped[int] = mapped_column(
+        nullable=False,
+        default=0,
+        server_default="0",
+        comment="上传用途：0=普通资源，1=用户头像",
+    )
+    file_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, comment="原始文件名")
+    file_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="文件MD5")
+    storage_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, comment="存储路径")
+    doc_category: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        comment="文档业务分类：resume/study_material/general（仅文件类型有意义）",
+    )
+    user_id: Mapped[int] = mapped_column(ForeignKey(
+        "users.id"), nullable=False, comment="上传用户ID")
+    expire_time: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True, comment="过期时间")
+    create_time: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        comment="创建时间",
+    )
+    
+class KnowledgeChunk(Base):
+    """知识库片段表：存每个文本切片的原文与顺序，作为 Qdrant 的数据源。"""
+
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        Index("idx_resource_id", "resource_id"),
+        Index("idx_vector_id", "vector_id"),
+        {"comment": "知识库片段表：Qdrant 向量库的权威原文存储"},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, autoincrement=True, comment="主键")
+    resource_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("resources.id"),
+        nullable=False,
+        comment="关联资源 FK（resources.id）",
+    )
+    chunk_index: Mapped[int] = mapped_column(
+        nullable=False, comment="片段顺序编号，从 0 开始")
+    text: Mapped[str] = mapped_column(
+        MEDIUMTEXT, nullable=False, comment="片段原文（权威来源）")
+    char_count: Mapped[int] = mapped_column(
+        nullable=False, comment="片段字符数")
+    vector_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        comment="对应 Qdrant Point 的 UUID（双向关联键）",
+    )
     created_at: Mapped[int] = mapped_column(
         BigInteger,
         nullable=False,

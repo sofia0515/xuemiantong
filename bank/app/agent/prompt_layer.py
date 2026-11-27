@@ -164,3 +164,16 @@ def build_stream_chain_context(
         "user_input": request_text,
     }
     return chain, stream_inputs
+
+
+def format_retrieved_chunks(chunks: list[dict]) -> str:
+    """把检索结果格式化为本轮用户问题的参考资料上下文。"""
+    if not chunks:
+        return ""
+
+    lines = ["【参考资料】"]
+    for i, chunk in enumerate(chunks, start=1):
+        lines.append(f"[来源 {i}] 文件：{chunk['file_name']}")
+        lines.append(chunk["text"])
+        lines.append("")
+    return "\n".join(lines).strip()

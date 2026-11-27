@@ -29,3 +29,19 @@ PROFILE_UPDATE_PATTERNS = [
 ]
 
 ALL_SECTIONS = {"goal", "ability", "preference", "interview"}
+
+PROFILE_JOB_PATTERN = re.compile(
+    r"(?:我|本人).{0,12}?(?:(初级|中级|高级|资深|专家)\s*)?"
+    r"([\w\u4e00-\u9fa5]{2,30}(?:工程师|程序员|架构师)|(?:前端|后端|全栈|测试|算法|运维|客户端|服务端)开发)",
+    re.IGNORECASE,
+)
+
+LIST_FIELDS = {"target_skills", "weak_topics", "interview_focus"}
+TEXT_FIELDS = {
+    "target_job",
+    "years_experience",
+    "target_level",
+    "learning_goal",
+    "learning_style",
+    "long_term_summary",
+}

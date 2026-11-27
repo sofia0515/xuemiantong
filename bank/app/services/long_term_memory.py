@@ -18,8 +18,12 @@ from app.services.long_term_memory_corpus import (
     PROFILE_READ_PATTERNS,
     PROFILE_UPDATE_PATTERNS,
     ALL_SECTIONS,
+    PROFILE_JOB_PATTERN,
+    LIST_FIELDS,
+    TEXT_FIELDS,
 )
 
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
 class LongTermMemory:
@@ -124,5 +128,198 @@ class LongTermMemory:
             *lines,
             "请仅将这些信息作为回答背景，不要主动说明你读取了长期记忆。",
         ])
+
+
+    @staticmethod
+    def submit_profile_update_async(
+        user_id: int,
+        user_message: str,
+        conversation_context: str = "",
+    ) -> None:
+        """命中写入意图时，在后台线程更新 UserProfile。"""
+        if not LongTermMemory.should_write(user_message, user_id):
+            return
+        print(f"[长期记忆] 提交画像更新任务：用户ID={user_id}，上下文长度={len(conversation_context)}")
+        _executor.submit(
+            LongTermMemory._update_profile_worker,
+            user_id,
+            user_message,
+            conversation_context,
+        )
+    @staticmethod
+    def _update_profile_worker(user_id: int, user_message: str, conversation_context: str = "") -> None:
+        """后台线程：抽取画像字段并合并入库。"""
+        updates = LongTermMemory._extract_updates(
+            user_message, conversation_context, user_id=user_id
+        )
+        if not updates:
+            print(f"[长期记忆] 画像更新结束：用户ID={user_id}，没有可写入字段")
+            return
+
+        db = SessionLocal()
+        try:
+            LongTermMemory._apply_updates(db, user_id, updates)
+        except Exception as exc:
+            print(f"长期画像更新失败：{exc}")
+        finally:
+            db.close()
+
     
-   
+    @staticmethod
+    def _extract_updates(user_message: str, conversation_context: str = "", user_id: int | None = None) -> dict[str, Any]:
+        """调用 DeepSeek，把用户消息抽取成画像字段字典。"""
+        from app.agent.llm import get_chat_model
+
+        context = (conversation_context or "").strip()[:MAX_UPDATE_CONTEXT_CHARS] or "无"
+        try:
+            response = get_chat_model(provider="deepseek").invoke(
+                PROFILE_UPDATE_PROMPT.format(context=context, message=user_message)
+            )
+        except Exception as exc:
+            print(f"长期画像抽取失败：{exc}")
+            return {}
+
+        data = LongTermMemory._loads_json(str(response.content).strip())
+        if not isinstance(data, dict):
+            data = {}
+        data = LongTermMemory._supplement_profile_updates(user_message, data)
+        if data:
+            print(f"[长期记忆] 抽取画像字段：用户ID={user_id}，字段={list(data.keys())}")
+
+        return data
+
+
+    @staticmethod
+    def _loads_json(text: str) -> Any:
+        """解析 JSON；若模型多输出了文字，则截取首个 JSON 对象。"""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                print("[长期记忆] 画像抽取结果不是有效 JSON")
+                return None
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                print("[长期记忆] 画像抽取结果 JSON 解析失败")
+                return None    
+
+    @staticmethod
+    def _supplement_profile_updates(user_message: str, updates: dict[str, Any]) -> dict[str, Any]:
+        """补全模型容易漏抽的当前职业字段。"""
+        if updates.get("target_job"):
+            return updates
+        match = PROFILE_JOB_PATTERN.search(user_message or "")
+        if not match:
+            return updates
+        level, job = match.groups()
+        job = re.sub(r"^(一名|一个|一位|初级|中级|高级|资深|专家)", "", job.strip())
+        if job:
+            updates["target_job"] = job
+        if level and not updates.get("target_level"):
+            updates["target_level"] = level
+        return updates
+
+    @staticmethod
+    def _apply_updates(db: Session, user_id: int, updates: dict[str, Any]) -> None:
+        """把抽取结果合并进 UserProfile。"""
+        profile = db.scalar(
+            select(UserProfile)
+            .where(UserProfile.user_id == user_id)
+            .with_for_update()
+        )
+        if profile is None:
+            try:
+                profile = UserProfile(user_id=user_id)
+                db.add(profile)
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                profile = db.scalar(
+                    select(UserProfile)
+                    .where(UserProfile.user_id == user_id)
+                    .with_for_update()
+                )
+
+        changed = False
+        for field, value in updates.items():
+            if field in LIST_FIELDS:
+                changed = LongTermMemory._merge_list(profile, field, value) or changed
+            elif field in TEXT_FIELDS:
+                changed = LongTermMemory._merge_text(profile, field, value) or changed
+
+        if changed:
+            db.commit()
+            print(f"[长期记忆] 画像已写入数据库：用户ID={user_id}")
+
+    @staticmethod
+    def _merge_list(profile: UserProfile, field: str, value: Any) -> bool:
+        """数组字段：使用本次抽取结果覆盖旧值，去重后最多保留 MAX_LIST_ITEMS 条。"""
+        if not isinstance(value, list):
+            return False
+        new_items: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text and text not in new_items:
+                new_items.append(text)
+        if not new_items:
+            return False
+        new_items = new_items[:MAX_LIST_ITEMS]
+        if list(getattr(profile, field) or []) == new_items:
+            return False
+        setattr(profile, field, new_items)
+        return True
+    
+    @staticmethod
+    def _merge_text(profile: UserProfile, field: str, value: Any) -> bool:
+        """字符串字段：非空则直接覆盖。"""
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        if not text:
+            return False
+        if field == "long_term_summary":
+            text = text[:MAX_SUMMARY_CHARS]
+        if getattr(profile, field) == text:
+            return False
+        setattr(profile, field, text)
+        return True
+        
+MAX_LIST_ITEMS = 10
+MAX_SUMMARY_CHARS = 500
+MAX_UPDATE_CONTEXT_CHARS = 8000
+
+PROFILE_UPDATE_PROMPT = """请从用户消息中抽取需要长期保存的用户画像信息。
+
+只抽取用户明确表达的信息，不要猜测。输出 JSON，不要输出多余文字。
+没有提到的字段不要输出。
+会话上下文只用于理解“这个、刚才说的”等指代，不要从 AI 回复中抽取用户画像。
+当前身份、当前职业、目标岗位都写入 target_job，例如“我是一名前端开发工程师”应抽取 target_job="前端开发工程师"。
+岗位级别只写入 target_level，例如“中级前端开发工程师”应同时抽取 target_level="中级"、target_job="前端开发工程师"。
+
+可用字段：
+- target_job: 字符串，目标岗位或当前职业
+- years_experience: 字符串，工作经验
+- target_level: 字符串，目标等级
+- learning_goal: 字符串，学习目标
+- learning_style: 字符串，学习偏好
+- target_skills: 字符串数组，已掌握技能
+- weak_topics: 字符串数组，薄弱点
+- interview_focus: 字符串数组，面试重点
+- long_term_summary: 字符串，用户画像摘要
+
+输出示例：
+{{
+  "target_job": "前端开发工程师",
+  "years_experience": "5年",
+  "target_level": "中级",
+  "weak_topics": ["React"]
+}}
+
+会话上下文：
+{context}
+
+用户消息：
+{message}
+"""
